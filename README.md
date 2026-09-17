@@ -124,6 +124,112 @@
 分析复用与预审相同的校验与裁决函数；相同货项以任意次序提交，完整响应
 字节级一致。
 
+### `POST /api/v1/stowage/reviews`
+
+交接审核的第一步：建立 `revision=1` 的草稿（DRAFT）。请求体在 `assess`
+的基础上增加一个幂等键 `commandId`：
+
+```json
+{
+  "hold": "HOLD-3",
+  "commandId": "handover-2026-09-17-0001",
+  "items": [
+    {"id": "C330", "category": "WET"},
+    {"id": "C101", "category": "FLAM"},
+    {"id": "C205", "category": "OXID"}
+  ]
+}
+```
+
+成功响应 `201`：保存规范化请求（货项按编号排序）与复用规则引擎得到的
+裁决，后续重试原样回放这些字节：
+
+```json
+{
+  "reviewId": "9f1c…",
+  "revision": 1,
+  "status": "DRAFT",
+  "commandId": "handover-2026-09-17-0001",
+  "hold": "HOLD-3",
+  "items": [
+    {"id": "C101", "category": "FLAM"},
+    {"id": "C205", "category": "OXID"},
+    {"id": "C330", "category": "WET"}
+  ],
+  "conclusion": "FORBID",
+  "evidence": [
+    {"first": "C101", "second": "C205", "firstCategory": "FLAM",
+     "secondCategory": "OXID", "rule": "FORBID"}
+  ]
+}
+```
+
+- 货项、舱位的校验规则与错误代码与 `assess` 完全相同，非法输入整体
+  拒绝，不产生草稿；
+- `commandId` 必须为非空字符串（否则 `INVALID_COMMAND_ID`）。
+
+### `POST /api/v1/stowage/reviews/{reviewId}/commands`
+
+在草稿上下达命令，把审核推进到已确认记录。命令有两种：
+
+- `REPLACE_ITEMS`：替换整舱货项，复用与 `assess` 完全相同的校验与裁决，
+  成功后 `revision` 加一；
+- `CONFIRM`：确认当前版本，`status` 变为 `CONFIRMED` 并冻结快照
+  （不推进版本号）。
+
+两种命令都必须携带幂等键 `commandId` 与乐观锁 `expectedRevision`：
+
+```json
+{
+  "commandId": "handover-2026-09-17-0002",
+  "action": "REPLACE_ITEMS",
+  "expectedRevision": 1,
+  "items": [
+    {"id": "A1", "category": "TOX"},
+    {"id": "B2", "category": "FLAM"}
+  ]
+}
+```
+
+成功响应 `200`，结构与建草稿响应一致（反映命令后的最新版本）。
+
+#### 幂等与判重（commandId）
+
+每个成功命令都按 `commandId` 全局判重，且失败的命令不占用标识：
+
+- **同标识同内容重放**：返回首次成功时的状态码与响应体，字节级一致
+  （货项按编号规范化，录入次序不同也算同内容）；即使审核已被后续命令
+  推进到更新版本，旧命令的重放仍返回它首次产生的那一版结果；
+- **同标识不同内容**：返回 `409 COMMAND_ID_REUSED`。因此版本冲突的
+  命令可以修正 `expectedRevision` 后用同一个 `commandId` 重试。
+
+判重先于一切状态检查执行。
+
+#### 新命令的错误顺序
+
+对未见过的 `commandId`，按固定顺序报错，便于程序化处理：
+
+| 顺序 | HTTP | 错误代码 | 含义 |
+| ---- | ---- | -------- | ---- |
+| 1 | 404 | `REVIEW_NOT_FOUND` | `reviewId` 不存在 |
+| 2 | 409 | `REVISION_CONFLICT` | `expectedRevision` 与当前版本不一致 |
+| 3 | 409 | `REVIEW_FINALIZED` | 审核已确认，快照冻结 |
+
+确认后任何携带当前版本号的新命令（无论替换还是再确认）都得到
+`REVIEW_FINALIZED`；携带错误版本号则先得到 `REVISION_CONFLICT`。
+
+命令体自身的校验错误仍为 `400`，代码包括 `INVALID_COMMAND_ID`、
+`INVALID_ACTION`（`action` 非 `REPLACE_ITEMS`/`CONFIRM`）、
+`INVALID_REVISION`（`expectedRevision` 非正整数），以及替换货项时与
+`assess` 相同的全部货项错误代码。
+
+#### 并发语义
+
+判重检查、版本检查与写入在服务端一次原子完成。多个命令争用同一版本时
+只有一个成功：版本号随即递增（替换）或审核被冻结（确认），其余命令得到
+`409` 且不留下任何部分状态。冲突方读取响应中的最新版本（或改用自己的
+`commandId` 重试），以新版本号重新提交即可。
+
 ### `GET /health`
 
 健康检查，返回 `{"status": "ok"}`。
@@ -177,9 +283,11 @@ app/
   main.py        # FastAPI 入口与错误处理
   rules.py       # 规则引擎：配对裁决、舱位级归并与单件移除影响分析
   validation.py  # 请求校验与稳定错误代码
+  reviews.py     # 交接审核：草稿/命令/确认的版本化、判重与并发原子存储
 tests/
-  test_rules.py  # 全部配对、优先级、依据排序、移除分析与排列不变性
-  test_api.py    # HTTP 行为、错误代码、响应字节级一致
+  test_rules.py    # 全部配对、优先级、依据排序、移除分析与排列不变性
+  test_api.py      # assess / removal-impact 的 HTTP 行为与字节级一致
+  test_reviews.py  # 草稿/命令/确认、判重重放、冲突重试与并发原子性
 verify/
   acceptance.py  # 对运行中实例的一次性 HTTP 验收
 Dockerfile
