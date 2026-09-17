@@ -124,6 +124,95 @@
 分析复用与预审相同的校验与裁决函数；相同货项以任意次序提交，完整响应
 字节级一致。
 
+### `POST /api/v1/stowage/reviews`
+
+交接审核把危险品预审从草稿推进到已确认记录。请求体在 `assess` 的基础上
+增加一个非空字符串 `commandId`（幂等键）：
+
+```json
+{
+  "commandId": "cmd-0001",
+  "hold": "HOLD-3",
+  "items": [
+    {"id": "C330", "category": "WET"},
+    {"id": "C101", "category": "FLAM"},
+    {"id": "C205", "category": "OXID"}
+  ]
+}
+```
+
+成功响应 `201`：建立 `revision=1` 的 `DRAFT` 草稿，`request` 保存规范化
+请求（货项按编号升序，录入次序不影响结果），`decision` 复用规则引擎裁决：
+
+```json
+{
+  "reviewId": "9f1c…",
+  "revision": 1,
+  "status": "DRAFT",
+  "request": {"hold": "HOLD-3", "items": [{"id": "C101", "category": "FLAM"}, {"id": "C205", "category": "OXID"}, {"id": "C330", "category": "WET"}]},
+  "decision": {"conclusion": "FORBID", "evidence": [{"first": "C101", "second": "C205", "firstCategory": "FLAM", "secondCategory": "OXID", "rule": "FORBID"}]}
+}
+```
+
+- **commandId 判重**：请求先按 `commandId` 判重。同标识且规范化后内容
+  相同（重试/并发重发，含货项次序不同）原样重放——同一个 `reviewId`、
+  字节一致的 `201` 响应，不会重复建单；同标识但内容不同返回
+  `409 COMMAND_ID_REUSED`。判重先于其他校验，因此重试即便是畸形请求也
+  得到稳定的 409。
+- 未见过的 `commandId` 才执行与 `assess` 完全相同的校验，错误代码与
+  `assess` 一致（`EMPTY_HOLD`、`ITEM_COUNT_OUT_OF_RANGE` 等）。
+
+### `POST /api/v1/stowage/reviews/{reviewId}/commands`
+
+对草稿下达命令，把草稿推进版本或冻结。请求体：
+
+```json
+{"commandId": "cmd-0002", "expectedRevision": 1, "action": "REPLACE",
+ "items": [{"id": "C101", "category": "WET"}, {"id": "C330", "category": "WET"}]}
+```
+
+- `commandId`：非空字符串，命令级幂等键（全局不可复用）；
+- `expectedRevision`：正整数，调用方认为当前所处的版本，用于乐观并发；
+- `action`：
+  - `REPLACE`：必须带 `items`（2–20 个货项，校验规则同 `assess`）。复用
+    既有校验与裁决整体重算，成功后 `revision` 加一，状态仍为 `DRAFT`，
+    响应结构与建单相同（`request` + `decision`）。非法输入整体拒绝，
+    返回 400，版本与状态保持不变，不留下部分状态；
+  - `CONFIRM`：无 `items`，不递增版本；把当前版本的请求与裁决冻结为
+    `snapshot`，状态变为 `FINALIZED`：
+
+```json
+{"reviewId": "9f1c…", "revision": 2, "status": "FINALIZED",
+ "snapshot": {"revision": 2, "hold": "HOLD-3", "request": {...}, "decision": {...}}}
+```
+
+**判重与错误顺序**（每个请求固定按此处理）：
+
+1. `commandId` 已落地：同评审、同命令类型、同 `expectedRevision` 且同内容
+   （CONFIRM 无请求体，前三者相同即同内容）→ 原样重放首次的成功响应，
+   字节一致、版本不重复推进；否则 `409 COMMAND_ID_REUSED`；
+2. 新命令依次按 `REVIEW_NOT_FOUND`（404）→ `REVISION_CONFLICT`（409，
+   带 `currentRevision`）→ `REVIEW_FINALIZED`（409）报错。
+
+**并发语义**：争用同一 `expectedRevision` 的多个命令只有一个原子成功：
+
+- 胜出者为 `REPLACE`：版本推进一次，其余命令得到 `REVISION_CONFLICT`，
+  用新的 `commandId` 按响应中的 `currentRevision` 重试即可；
+- 胜出者为 `CONFIRM`：评审冻结在当前版本（版本不递增），其余命令得到
+  `REVISION_CONFLICT`（版本已过期时）或 `REVIEW_FINALIZED`（版本相同但
+  已冻结时），之后再无任何命令可以改变快照。
+
+| 错误代码              | 含义                                                 |
+| --------------------- | ---------------------------------------------------- |
+| `COMMAND_ID_REUSED`   | commandId 已落地但本次内容/类型/版本与其不一致（409） |
+| `REVIEW_NOT_FOUND`    | reviewId 不存在（404）                                |
+| `REVISION_CONFLICT`   | expectedRevision 与当前版本不一致（409，含 currentRevision） |
+| `REVIEW_FINALIZED`    | 评审已确认冻结，不再接受命令（409）                   |
+| `INVALID_REQUEST`     | commandId/action/expectedRevision 结构非法（400）     |
+
+评审数据为进程内存储（服务重启即清空），单把锁保证“判重 → 版本比对 →
+应用”整段原子，适配交接审核场景的去重与防覆盖。
+
 ### `GET /health`
 
 健康检查，返回 `{"status": "ok"}`。
@@ -176,12 +265,14 @@ docker compose up --build --exit-code-from verify verify
 app/
   main.py        # FastAPI 入口与错误处理
   rules.py       # 规则引擎：配对裁决、舱位级归并与单件移除影响分析
-  validation.py  # 请求校验与稳定错误代码
+  validation.py  # 请求校验、规范化与稳定错误代码
+  store.py       # 评审存储：草稿版本、乐观并发、命令幂等与冻结快照
 tests/
   test_rules.py  # 全部配对、优先级、依据排序、移除分析与排列不变性
-  test_api.py    # HTTP 行为、错误代码、响应字节级一致
+  test_api.py    # assess/removal-impact 的 HTTP 行为、错误代码、字节级一致
+  test_reviews.py # 评审建单、替换、确认、判重、错误顺序与并发原子性
 verify/
-  acceptance.py  # 对运行中实例的一次性 HTTP 验收
+  acceptance.py  # 对运行中实例的一次性 HTTP 验收（含并发争用）
 Dockerfile
 docker-compose.yml
 requirements.txt
